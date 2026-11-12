@@ -1,0 +1,723 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.4" snapToGrid="false">
+  <code><![CDATA[;; =====================================================================
+;; POLITICAL COMPROMISE MODEL  (DC Seminar, agent-based model, NetLogo 7)
+;; =====================================================================
+;;
+;; PURPOSE
+;;   Predict how often a small legislature passes a compromise bill over a
+;;   series of votes. Two factors drive it:
+;;     (1) how extreme each legislator's constituency is, and
+;;     (2) how legislators learn from the results of past votes
+;;         (imitation dynamics, reinforcement learning, or both).
+;;
+;; LEVELS FROM THE ORIGINAL OUTLINE -> SETTINGS IN THIS FILE
+;;   All levels live in this one model, chosen with two settings,
+;;   instead of separate files:
+;;     Level 0-1 : learning-mode = "Imitation",     num-agents = 6
+;;     Level 0-2 : learning-mode = "Reinforcement", num-agents = 6
+;;     Level 0.5 : Imitation or Reinforcement,      num-agents = 30
+;;     Level 1   : learning-mode = "Combined",      num-agents = 30
+;;
+;; THE BILLS
+;;   Every trial has three bills: RED, BLUE and PURPLE. Purple is a single
+;;   bill that already contains concessions from both parties. Compromise
+;;   means "purple got the most votes". It does NOT mean that a particular
+;;   red legislator and blue legislator agreed with each other. That is why
+;;   an earlier version's lines drawing "compromise links" between agents
+;;   were removed. As the outline specifies, agents only ever vote for their
+;;   own party's bill or for purple, never for the other party's bill.
+;;
+;; SPACE AND TIME (from the outline)
+;;   - Agents sit still in a 2-D view. Location has no meaning beyond
+;;     showing red on the left and blue on the right.
+;;   - Time is counted in trials, not clock time. Each tick is one new bill.
+;;   - Agents act synchronously: everyone votes, then everyone learns.
+;;   - The run stops after the number of trials the user chooses.
+;;
+;; DESIGN DECISIONS MADE WITH THE MODEL'S AUTHOR WHILE BUILDING IT
+;;   1. Platform: NetLogo, one file with a mode switch (see levels above).
+;;   2. Vote rule: plurality. The bill with the most votes wins, and a tie
+;;      for first place is a "tie", which pays everyone 0.
+;;   3. Imitation signal: u_a = the average payoff of ALL agents in the
+;;      chamber who chose action a, pooling both parties. Known side effect,
+;;      which the author reviewed and chose to keep: when red's bill wins,
+;;      red holdouts (5) and blue holdouts (1) are averaged together, so
+;;      holding out can look good to blue agents even though blue lost.
+;;   4. Imitation equation: the outline's literal logit is the DEFAULT.
+;;      Because every agent sees the same u values, this makes all agents
+;;      identical after trial 1, so extremism only shapes the first vote.
+;;      The keep-own-tendency? switch (off by default) is an optional
+;;      variant that keeps agents different from each other.
+;;   5. When there is nothing to compare (everyone made the same choice,
+;;      or the vote tied), imitation leaves probabilities unchanged.
+;;   6. Compromise success rate = purple wins / trials run.
+;;   7. Combined mode: P(use imitation) = 1 - extremism, so agents from
+;;      more extreme districts rely more on reinforcement. Imitation and
+;;      reinforcement are deliberately NOT synchronized. An imitation
+;;      change lasts until that agent's next reinforcement step, which
+;;      recomputes P from its own propensities. Reinforcement acts as
+;;      long-term memory. The author chose this over syncing the two.
+;;   8. Reinforcement uses forgetting (recency), fixed at 0.1 per trial,
+;;      roughly the value Erev & Roth (1998) estimated from human
+;;      experiments. It is a constant in the code, not a slider.
+;;   9. The payoff table is fixed in the code, with no payoff sliders.
+;;  10. Lambda (imitation sensitivity) is a slider from 0 to 5. In the
+;;      logit, lambda can be any number >= 0; it is not limited to 0-1.
+;;  11. Extremism input:
+;;        6 agents  -> one slider per agent, used exactly.
+;;        30 agents -> 5 groups of 3 per party. The user picks a bucket
+;;                     (0-20, 20-40, 40-60, 60-80 or 80-100%) and each
+;;                     agent's value is drawn at random within it.
+;;      NetLogo cannot show or hide widgets based on another setting, so
+;;      both sets of controls are always visible, under labeled headers.
+;;  12. Visuals: agents are circles on a plain white background, colored
+;;      by the bill they just voted for. Each label always shows that
+;;      agent's P(compromise) for the next trial. The votes bar chart uses
+;;      solid bars.
+;;
+;; BUG FIXES ADDED DURING DEBUGGING
+;;   A. All settings are locked in at setup, so moving a widget mid-run does
+;;      nothing until the next setup. The outline says parameters change
+;;      only on reset.
+;;   B. A tied vote gives imitation no signal. A tie pays everyone 0, and
+;;      without this rule the literal logit would reset all agents to 50/50.
+;;   C. P(compromise) is always kept between 1% and 99%, including at the
+;;      start. Without this limit, learning pushed agents to within ~1e-12
+;;      of 0 or 1, where they could never change again. The author chose
+;;      1%-99%. (5%-95% was used for a while, then switched back to 1%-99%.)
+;; =====================================================================
+
+
+;; ---------------------------------------------------------------------
+;; GLOBAL VARIABLES
+;; Sliders, choosers and switches on the Interface tab are also globals.
+;; ---------------------------------------------------------------------
+globals [
+  winner                              ; result of latest trial: "red", "blue", "purple" or "tie"
+  red-votes blue-votes purple-votes   ; votes cast in the latest trial (bar chart)
+  total-red total-blue total-purple   ; cumulative votes over all trials (purple-vote-share monitor)
+  red-wins blue-wins purple-wins ties ; cumulative outcomes (purple-wins drives the success rate)
+  u-compromise                        ; avg payoff of ALL agents who voted purple last trial (decision 3)
+  u-hold                              ; avg payoff of ALL agents who voted their own party's bill last trial
+  imitation-info?                     ; true when imitation has a usable signal this trial (decision 5, fix B)
+
+  ;; Copies of the Interface settings, saved at setup (fix A).
+  ;; The rest of the code reads these copies, never the widgets directly.
+  run-mode        ; copy of learning-mode
+  run-lambda      ; copy of lambda
+  run-keep-own?   ; copy of keep-own-tendency?
+  run-trials      ; copy of num-trials
+]
+
+
+;; ---------------------------------------------------------------------
+;; AGENT VARIABLES
+;; There is one agent type: a legislator. The outline also had no other
+;; objects in the model (no institutions or bills as agents).
+;; ---------------------------------------------------------------------
+turtles-own [
+  party          ; "red" or "blue": fixed for the whole run
+  group-id       ; constituency group: 1-3 with 6 agents (one agent each), 1-5 with 30 (3 agents each)
+  extremism      ; constituency extremism, 0-1. Set once at setup and never changes.
+  p-compromise   ; current probability of voting purple. This is what learning changes.
+  choice         ; vote this trial: "purple", or the agent's own party ("red"/"blue")
+  payoff         ; reward this trial, from the payoff table
+  q-compromise   ; reinforcement propensity ("accumulated experience") for voting purple
+  q-hold         ; reinforcement propensity for voting own party's bill
+  p-imitate      ; Combined mode only: chance of using imitation this trial (= 1 - extremism, decision 7)
+  method         ; learning rule actually used this trial: "imitation" or "reinforcement"
+]
+
+
+;; =====================================================================
+;; SETUP: build the chamber and give every agent its starting state
+;; =====================================================================
+
+to setup
+  clear-all
+  set-default-shape turtles "circle"    ; decision 12: agents are circles
+  set winner "none"
+  set imitation-info? false
+
+  ;; Fix A: lock in settings now. Changing them mid-run has no effect
+  ;; until the next setup, matching "users must reset to change parameters".
+  set run-mode learning-mode
+  set run-lambda lambda
+  set run-keep-own? keep-own-tendency?
+  set run-trials num-trials
+
+  draw-chamber
+  make-agents "red"
+  make-agents "blue"
+  reset-ticks
+  do-plots
+end
+
+;; Decision 12: plain white background. The earlier red/purple/blue
+;; background bands were removed at the author's request.
+to draw-chamber
+  ask patches [ set pcolor white ]
+end
+
+;; Creates one party's legislators: 3 with 6 agents, 15 with 30 agents.
+;; The outline splits agents evenly between the two parties.
+to make-agents [ pty ]
+  let per-party num-agents / 2
+  let i 0
+  repeat per-party [
+    create-turtles 1 [
+      set party pty
+
+      ;; ---- constituency extremism (decision 11) ----
+      ifelse num-agents = 6 [
+        ;; Level 0: each of the 3 per-party sliders sets one agent exactly.
+        set group-id i + 1
+        set extremism base-extremism pty group-id
+      ] [
+        ;; Levels 0.5 / 1: each party has 5 groups of 3. Each group shares
+        ;; a bucket, and each agent's exact value is random within it.
+        ;; This replaced the outline's original "+/- 5%" spread.
+        set group-id floor (i / 3) + 1
+        set extremism bucket-extremism pty group-id
+      ]
+
+      ;; ---- starting willingness to compromise ----
+      ;; From the outline: willingness = the inverse of extremism. A 70%
+      ;; extreme district gives a 30% chance of voting purple. Fix C keeps
+      ;; it within 1%-99%.
+      set p-compromise bound-p (1 - extremism)
+
+      ;; ---- reinforcement starting propensities (Level 0-2 / Combined) ----
+      ;; Split initial-propensity in the same ratio as p-compromise, so an
+      ;; agent's first reinforcement-based P matches its constituency.
+      ;; A larger initial-propensity means more "prior experience", so each
+      ;; new payoff moves the agent less (slower learning).
+      set q-compromise initial-propensity * p-compromise
+      set q-hold initial-propensity * (1 - p-compromise)
+
+      ;; ---- Combined mode (Level 1, decision 7) ----
+      ;; More extreme districts -> more reliance on reinforcement learning,
+      ;; which the outline describes as more prone to feedback loops.
+      set p-imitate 1 - extremism
+
+      set choice ""
+      set method ""
+      set heading 0
+      place-agent i
+      set color ifelse-value (party = "red") [ red ] [ blue ]   ; party color until the first vote
+      set label-color black
+      update-label
+    ]
+    set i i + 1
+  ]
+end
+
+;; Places agents in fixed seats: red on the left, blue on the right.
+;; Position is only for display and plays no part in the model (outline).
+to place-agent [ i ]
+  let side ifelse-value (party = "red") [ -1 ] [ 1 ]
+  ifelse num-agents = 6 [
+    set size 3
+    setxy (side * 9) (6 - 6 * i)            ; one column of 3 per party
+  ] [
+    set size 2
+    let col i mod 3                          ; 3 agents per row = one constituency group
+    let row floor (i / 3)                    ; 5 rows = 5 groups
+    setxy (side * (8 + 3 * col)) (12 - 6 * row)
+  ]
+end
+
+;; 6-agent mode: reads the exact extremism slider for agent g (1-3).
+to-report base-extremism [ pty g ]
+  let sliders ifelse-value (pty = "red")
+    [ (list red-agent-1 red-agent-2 red-agent-3) ]
+    [ (list blue-agent-1 blue-agent-2 blue-agent-3) ]
+  report (item (g - 1) sliders) / 100
+end
+
+;; The five bucket choices, in order. A chooser's position in this list
+;; (0-4) gives the bucket's lower edge in steps of 20%.
+to-report bucket-names
+  report [ "0-20%" "20-40%" "40-60%" "60-80%" "80-100%" ]
+end
+
+;; 30-agent mode: random extremism inside group g's chosen bucket,
+;; e.g. "60-80%" gives a uniform random value from 0.60 up to (not including) 0.80.
+to-report bucket-extremism [ pty g ]
+  let buckets ifelse-value (pty = "red")
+    [ (list red-group-1 red-group-2 red-group-3 red-group-4 red-group-5) ]
+    [ (list blue-group-1 blue-group-2 blue-group-3 blue-group-4 blue-group-5) ]
+  let b position (item (g - 1) buckets) bucket-names
+  report (20 * b + random-float 20) / 100
+end
+
+;; Fix C: every legislator always keeps at least a 1% chance of breaking
+;; from their usual vote. Without this, learning drives P(compromise) to
+;; ~0 or ~1 and agents lock in permanently. The author chose 1%-99%.
+to-report p-floor
+  report 0.01
+end
+
+;; Clamps any probability into [p-floor, 1 - p-floor] = [0.01, 0.99].
+to-report bound-p [ p ]
+  report max (list p-floor (min (list (1 - p-floor) p)))
+end
+
+
+;; =====================================================================
+;; MAIN LOOP: one tick = one trial = one bill voted on
+;; Order each trial: vote -> count -> pay -> learn -> redraw -> plot.
+;; Agents act synchronously: everyone votes before anyone learns.
+;; =====================================================================
+
+to go
+  if ticks >= run-trials [ stop ]   ; stop after the user-chosen number of trials
+  vote
+  tally
+  pay
+  learn
+  visualize
+  tick
+  do-plots
+end
+
+;; ---------------------------------------------------------------------
+;; VOTE: each agent votes purple with probability p-compromise and
+;; otherwise votes for its own party's bill. On trial 1, p-compromise comes
+;; straight from extremism. Later it is whatever learning produced.
+;; ---------------------------------------------------------------------
+to vote
+  ask turtles [
+    set choice ifelse-value (random-float 1 < p-compromise) [ "purple" ] [ party ]
+  ]
+end
+
+;; ---------------------------------------------------------------------
+;; TALLY: count votes and pick the winner (decision 2: plurality rule).
+;; ---------------------------------------------------------------------
+to tally
+  set red-votes    count turtles with [ choice = "red" ]
+  set blue-votes   count turtles with [ choice = "blue" ]
+  set purple-votes count turtles with [ choice = "purple" ]
+  set total-red    total-red + red-votes
+  set total-blue   total-blue + blue-votes
+  set total-purple total-purple + purple-votes
+
+  ;; Most votes wins. If two or more bills share the top count, the trial
+  ;; is a "tie". With 6 agents this is common, e.g. 2-2-2 or 3-3-0.
+  let counts (list red-votes blue-votes purple-votes)
+  let top max counts
+  ifelse length filter [ c -> c = top ] counts > 1 [
+    set winner "tie"
+    set ties ties + 1
+  ] [
+    set winner item (position top counts) [ "red" "blue" "purple" ]
+    if winner = "red"    [ set red-wins red-wins + 1 ]
+    if winner = "blue"   [ set blue-wins blue-wins + 1 ]
+    if winner = "purple" [ set purple-wins purple-wins + 1 ]
+  ]
+end
+
+;; ---------------------------------------------------------------------
+;; PAY: every agent gets a reward from the outline's payoff table, based
+;; on its own vote and on which bill won.
+;; ---------------------------------------------------------------------
+to pay
+  ask turtles [ set payoff payoff-for choice party winner ]
+end
+
+;; Payoff table from the outline (decision 9: fixed, not adjustable)
+;;                     own bill wins | purple wins | own bill loses | tie
+;;  compromise               3       |      4      |       0        |  0
+;;  don't compromise         5       |      2      |       1        |  0
+;; "Own bill" means the agent's party's bill. "Loses" means the OTHER
+;; party's bill won.
+to-report payoff-for [ ch pty win ]
+  if win = "tie" [ report 0 ]
+  ifelse ch = "purple" [
+    if win = "purple" [ report 4 ]   ; voted for compromise and it passed
+    if win = pty      [ report 3 ]   ; compromised, but own party's bill passed anyway
+    report 0                         ; compromised, and the other party's bill passed
+  ] [
+    if win = pty      [ report 5 ]   ; held out and own party's bill passed (best case)
+    if win = "purple" [ report 2 ]   ; held out but compromise passed
+    report 1                         ; held out and the other party's bill passed
+  ]
+end
+
+
+;; =====================================================================
+;; LEARNING: update each agent's p-compromise for the NEXT trial
+;; =====================================================================
+
+to learn
+  ;; ---- imitation signal (decision 3) ----
+  ;; Average payoff for each action across the WHOLE chamber, both parties
+  ;; pooled. Every agent sees the same two numbers.
+  let comps turtles with [ choice = "purple" ]
+  let holds turtles with [ choice != "purple" ]
+
+  ;; Decision 5 and fix B: there is no signal if nobody (or everybody)
+  ;; compromised, or if the vote tied. A tie pays everyone 0, which would
+  ;; otherwise reset everyone to 50/50.
+  set imitation-info? (any? comps and any? holds and winner != "tie")
+  if imitation-info? [
+    set u-compromise mean [ payoff ] of comps
+    set u-hold mean [ payoff ] of holds
+  ]
+
+  ask turtles [
+    ;; Propensities are updated EVERY trial in every mode, so reinforcement
+    ;; memory stays current even for agents that used imitation this trial.
+    reinforce-accumulate
+
+    ;; Pick this trial's learning rule
+    if run-mode = "Imitation"     [ set method "imitation" ]       ; Level 0-1
+    if run-mode = "Reinforcement" [ set method "reinforcement" ]   ; Level 0-2
+    if run-mode = "Combined" [                                      ; Level 1, decision 7
+      set method ifelse-value (random-float 1 < p-imitate) [ "imitation" ] [ "reinforcement" ]
+    ]
+    ifelse method = "imitation" [ imitate ] [ reinforce ]
+  ]
+end
+
+;; ---------------------------------------------------------------------
+;; IMITATION DYNAMICS (Level 0-1). The outline's logit equation:
+;;     P(a) = e^(lambda * u_a) / sum over q of e^(lambda * u_q)
+;; with a in {compromise, hold}.
+;;   lambda = how strongly agents respond to payoff differences.
+;;            0 -> payoffs ignored (literal form gives everyone 50/50).
+;;            Higher -> a small payoff edge pulls nearly everyone to the
+;;            better action. Because payoffs run 0-5, lambda = 1 is
+;;            already a strong response.
+;;
+;; keep-own-tendency? OFF (DEFAULT, decision 4): the literal equation.
+;;   Every agent gets the SAME probability after trial 1, so extremism
+;;   only matters for the first vote. In testing, the first vote then
+;;   largely decided the whole run: purple won ~0% or ~100% of the time.
+;; keep-own-tendency? ON (optional variant): each term is weighted by the
+;;   agent's current probability,  P'(a) ∝ P(a) * e^(lambda * u_a).
+;;   lambda = 0 then means "no change", and agents keep their
+;;   constituency-driven differences.
+;; ---------------------------------------------------------------------
+to imitate
+  if imitation-info? [
+    let wc exp (run-lambda * u-compromise)   ; weight on compromising
+    let wh exp (run-lambda * u-hold)         ; weight on holding out
+    ifelse run-keep-own? [
+      set p-compromise (p-compromise * wc) / (p-compromise * wc + (1 - p-compromise) * wh)
+    ] [
+      set p-compromise wc / (wc + wh)
+    ]
+    set p-compromise bound-p p-compromise    ; fix C: stay within 1%-99%
+  ]
+  ;; With no signal, p-compromise is left unchanged (decision 5).
+end
+
+;; ---------------------------------------------------------------------
+;; REINFORCEMENT LEARNING (Level 0-2). The outline's equation is
+;;     p_k(t) = q_k(t) / sum over j of q_j(t)
+;; (Roth-Erev). Each agent learns only from its OWN payoffs, not from
+;; others. With forgetting (decision 8), each trial:
+;;     q_k <- (1 - forgetting) * q_k + payoff   if k was chosen
+;;     q_k <- (1 - forgetting) * q_k            otherwise
+;; ---------------------------------------------------------------------
+
+;; Decision 8: fixed recency rate. With 0.1, a payoff from 10 trials ago
+;; counts about 35% as much as the latest one (0.9^10 ≈ 0.35). It is a
+;; constant here, not a slider, at the author's request.
+to-report forgetting
+  report 0.1
+end
+
+;; Decays old experience, then adds this trial's payoff to the action taken.
+;; Runs every trial for every agent (see learn).
+to reinforce-accumulate
+  set q-compromise (1 - forgetting) * q-compromise
+  set q-hold (1 - forgetting) * q-hold
+  ifelse choice = "purple"
+    [ set q-compromise q-compromise + payoff ]
+    [ set q-hold q-hold + payoff ]
+end
+
+;; Turns propensities into a probability, kept within 1%-99% (fix C).
+;; Decision 7: this recomputes P from the agent's own propensities alone,
+;; so it overrides any earlier imitation change. That is intentional:
+;; reinforcement is the agent's long-term memory. The guard skips the
+;; update if both propensities are 0, which would otherwise divide by zero.
+to reinforce
+  if q-compromise + q-hold > 0 [
+    set p-compromise bound-p (q-compromise / (q-compromise + q-hold))
+  ]
+end
+
+
+;; =====================================================================
+;; VISUALS AND OUTPUTS
+;; =====================================================================
+
+;; Decision 12: each circle takes the color of the bill it just voted for
+;; (red, blue or purple). No links are drawn, because purple is a single
+;; compromise bill, not an agreement between specific agents.
+to visualize
+  ask turtles [
+    set color ifelse-value (choice = "purple") [ violet ] [ ifelse-value (party = "red") [ red ] [ blue ] ]
+    update-label
+  ]
+end
+
+;; Decision 12: the label always shows P(compromise) for the NEXT trial.
+;; The earlier on/off label switch was removed.
+to update-label
+  set label precision p-compromise 2
+end
+
+;; ---- outputs listed in the outline ----
+
+;; Decision 6: compromise success rate = purple bills passed / trials run.
+;; For example, 0.8 means purple won 80% of the votes so far.
+to-report compromise-success-rate
+  report ifelse-value (ticks > 0) [ purple-wins / ticks ] [ 0 ]
+end
+
+;; Extra indicator: share of ALL individual votes that went to purple.
+;; This differs from the success rate: purple can win often with modest
+;; vote share, because it draws votes from both parties.
+to-report purple-vote-share
+  let total total-red + total-blue + total-purple
+  report ifelse-value (total > 0) [ total-purple / total ] [ 0 ]
+end
+
+;; Average P(compromise) within one party (Willingness plot and monitors).
+;; In literal Imitation mode, red, blue and all-agents averages are
+;; identical after trial 1 (decision 4), so the three plot lines overlap.
+to-report mean-p [ pty ]
+  report mean [ p-compromise ] of turtles with [ party = pty ]
+end
+
+;; Monitors use these argument-free versions.
+to-report mean-p-red
+  report mean-p "red"
+end
+
+to-report mean-p-blue
+  report mean-p "blue"
+end
+
+;; Average constituency extremism of all agents, as a percent. Uses each
+;; agent's ACTUAL value: with 30 agents, the random number drawn inside its
+;; group's bucket, not the bucket midpoint. With 6 agents it is simply the
+;; average of the six sliders. Fixed for the whole run, since extremism
+;; never changes after setup. Added at the author's request.
+to-report mean-extremism
+  report 100 * mean [ extremism ] of turtles
+end
+
+;; Share of agents that used imitation (vs reinforcement) on the last trial.
+;; Only meaningful in Combined mode. In the other modes it is always 100 or 0.
+to-report pct-imitating
+  report 100 * count turtles with [ method = "imitation" ] / count turtles
+end
+
+;; Draws all four plots from code, not from widget update code, so every
+;; plot uses the same trial numbering.
+;;   Votes This Trial          - bar chart of the latest vote (outline)
+;;   Purple Vote % per Trial   - % of agents voting purple in each trial. This
+;;                               replaced the outline's cumulative-votes line chart
+;;                               at the author's request, to show each trial on its own
+;;                               rather than running totals
+;;   Willingness to Compromise - average P(compromise): red, blue, everyone
+;;   Compromise Success Rate   - purple wins / trials so far
+to do-plots
+  set-current-plot "Votes This Trial"
+  clear-plot                                ; shows only the latest trial
+  set-plot-y-range 0 count turtles
+  if ticks > 0 [
+    draw-bar "red"    0 red-votes
+    draw-bar "purple" 1 purple-votes
+    draw-bar "blue"   2 blue-votes
+  ]
+
+  set-current-plot "Purple Vote % per Trial"
+  if ticks > 0 [   ; nothing to show before the first vote
+    set-current-plot-pen "purple %" plotxy ticks 100 * purple-votes / count turtles
+  ]
+
+  set-current-plot "Willingness to Compromise"
+  set-current-plot-pen "red party"  plotxy ticks mean-p "red"
+  set-current-plot-pen "blue party" plotxy ticks mean-p "blue"
+  set-current-plot-pen "all agents" plotxy ticks mean [ p-compromise ] of turtles
+
+  set-current-plot "Compromise Success Rate"
+  set-current-plot-pen "success rate" plotxy ticks compromise-success-rate
+end
+
+;; Decision 12: NetLogo 7 draws bar-mode plots as outlines, so a solid
+;; colored bar is built by stacking many 0.01-wide bars side by side,
+;; from x0 + 0.1 to x0 + 0.9.
+to draw-bar [ pen-name x0 h ]
+  set-current-plot-pen pen-name
+  set-plot-pen-interval 0.01
+  let x x0 + 0.1
+  while [ x < x0 + 0.9 ] [
+    plotxy x h
+    set x x + 0.01
+  ]
+end
+]]></code>
+  <widgets>
+    <view x="440" wrappingAllowedX="false" y="10" frameRate="30.0" minPycor="-16" height="429" showTickCounter="true" patchSize="13.0" fontSize="10" wrappingAllowedY="false" width="429" tickCounterLabel="trials" maxPycor="16" updateMode="1" maxPxcor="16" minPxcor="-16"></view>
+    <button x="5" y="10" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="95" display="setup">setup</button>
+    <button x="105" y="10" height="40" disableUntilTicks="true" forever="false" kind="Observer" width="100" display="one trial">go</button>
+    <button x="5" y="55" height="40" disableUntilTicks="true" forever="true" kind="Observer" width="200" display="run all trials">go</button>
+    <chooser x="5" y="100" height="60" variable="learning-mode" current="0" width="200" display="learning-mode"><choice type="string" value="Imitation"></choice><choice type="string" value="Reinforcement"></choice><choice type="string" value="Combined"></choice></chooser>
+    <chooser x="5" y="165" height="60" variable="num-agents" current="0" width="200" display="num-agents"><choice type="double" value="6.0"></choice><choice type="double" value="30.0"></choice></chooser>
+    <slider x="5" step="1" y="230" max="1000" width="200" display="num-trials" height="50" min="1" direction="Horizontal" default="100" variable="num-trials"></slider>
+    <slider x="5" step="0.1" y="285" max="5" width="200" display="lambda" height="50" min="0" direction="Horizontal" default="1.0" variable="lambda"></slider>
+    <slider x="5" step="1" y="340" max="50" width="200" display="initial-propensity" height="50" min="1" direction="Horizontal" default="10" variable="initial-propensity"></slider>
+    <switch x="5" y="395" height="40" on="false" variable="keep-own-tendency?" width="200" display="keep-own-tendency?"></switch>
+    <note x="5" y="442" backgroundDark="0" fontSize="11" width="200" markdown="false" height="18" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">PAYOFF MATRIX</note>
+    <note x="5" y="462" backgroundDark="0" fontSize="9" width="62" markdown="false" height="28" textColorDark="-1" textColorLight="-16777216" backgroundLight="0"></note>
+    <note x="67" y="462" backgroundDark="0" fontSize="9" width="34" markdown="false" height="28" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">own
+wins</note>
+    <note x="103" y="462" backgroundDark="0" fontSize="9" width="34" markdown="false" height="28" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">purple
+wins</note>
+    <note x="139" y="462" backgroundDark="0" fontSize="9" width="34" markdown="false" height="28" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">own
+loses</note>
+    <note x="175" y="462" backgroundDark="0" fontSize="9" width="30" markdown="false" height="28" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">tie</note>
+    <note x="5" y="494" backgroundDark="0" fontSize="9" width="62" markdown="false" height="28" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Compromise</note>
+    <note x="75" y="498" backgroundDark="0" fontSize="12" width="26" markdown="false" height="18" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">3</note>
+    <note x="111" y="498" backgroundDark="0" fontSize="12" width="26" markdown="false" height="18" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">4</note>
+    <note x="147" y="498" backgroundDark="0" fontSize="12" width="26" markdown="false" height="18" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">0</note>
+    <note x="183" y="498" backgroundDark="0" fontSize="12" width="22" markdown="false" height="18" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">0</note>
+    <note x="5" y="526" backgroundDark="0" fontSize="9" width="62" markdown="false" height="28" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Don't
+compromise</note>
+    <note x="75" y="530" backgroundDark="0" fontSize="12" width="26" markdown="false" height="18" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">5</note>
+    <note x="111" y="530" backgroundDark="0" fontSize="12" width="26" markdown="false" height="18" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">2</note>
+    <note x="147" y="530" backgroundDark="0" fontSize="12" width="26" markdown="false" height="18" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">1</note>
+    <note x="183" y="530" backgroundDark="0" fontSize="12" width="22" markdown="false" height="18" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">0</note>
+    <note x="5" y="560" backgroundDark="0" fontSize="9" width="200" markdown="false" height="40" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Rows = agent's vote, columns = which bill won. Labels on agents = P(compromise) next trial.</note>
+    <monitor x="5" precision="1" y="605" height="55" fontSize="11" width="200" display="% agents imitating (last trial)">pct-imitating</monitor>
+    <monitor x="5" precision="1" y="665" height="55" fontSize="11" width="200" display="average extremism (%)">mean-extremism</monitor>
+    <note x="210" y="10" backgroundDark="0" fontSize="11" width="220" markdown="false" height="18" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">USED ONLY WITH 6 AGENTS: extremism %</note>
+    <slider x="210" step="1" y="30" max="100" width="220" display="red-agent-1" height="45" min="0" direction="Horizontal" default="70" variable="red-agent-1" units="%"></slider>
+    <slider x="210" step="1" y="77" max="100" width="220" display="red-agent-2" height="45" min="0" direction="Horizontal" default="50" variable="red-agent-2" units="%"></slider>
+    <slider x="210" step="1" y="124" max="100" width="220" display="red-agent-3" height="45" min="0" direction="Horizontal" default="30" variable="red-agent-3" units="%"></slider>
+    <slider x="210" step="1" y="171" max="100" width="220" display="blue-agent-1" height="45" min="0" direction="Horizontal" default="70" variable="blue-agent-1" units="%"></slider>
+    <slider x="210" step="1" y="218" max="100" width="220" display="blue-agent-2" height="45" min="0" direction="Horizontal" default="50" variable="blue-agent-2" units="%"></slider>
+    <slider x="210" step="1" y="265" max="100" width="220" display="blue-agent-3" height="45" min="0" direction="Horizontal" default="30" variable="blue-agent-3" units="%"></slider>
+    <note x="210" y="315" backgroundDark="0" fontSize="11" width="220" markdown="false" height="32" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">USED ONLY WITH 30 AGENTS: extremism
+bucket per group (random within bucket)</note>
+    <chooser x="210" y="350" height="55" variable="red-group-1" current="3" width="108" display="red-group-1"><choice type="string" value="0-20%"></choice><choice type="string" value="20-40%"></choice><choice type="string" value="40-60%"></choice><choice type="string" value="60-80%"></choice><choice type="string" value="80-100%"></choice></chooser>
+    <chooser x="322" y="350" height="55" variable="blue-group-1" current="3" width="108" display="blue-group-1"><choice type="string" value="0-20%"></choice><choice type="string" value="20-40%"></choice><choice type="string" value="40-60%"></choice><choice type="string" value="60-80%"></choice><choice type="string" value="80-100%"></choice></chooser>
+    <chooser x="210" y="408" height="55" variable="red-group-2" current="2" width="108" display="red-group-2"><choice type="string" value="0-20%"></choice><choice type="string" value="20-40%"></choice><choice type="string" value="40-60%"></choice><choice type="string" value="60-80%"></choice><choice type="string" value="80-100%"></choice></chooser>
+    <chooser x="322" y="408" height="55" variable="blue-group-2" current="2" width="108" display="blue-group-2"><choice type="string" value="0-20%"></choice><choice type="string" value="20-40%"></choice><choice type="string" value="40-60%"></choice><choice type="string" value="60-80%"></choice><choice type="string" value="80-100%"></choice></chooser>
+    <chooser x="210" y="466" height="55" variable="red-group-3" current="1" width="108" display="red-group-3"><choice type="string" value="0-20%"></choice><choice type="string" value="20-40%"></choice><choice type="string" value="40-60%"></choice><choice type="string" value="60-80%"></choice><choice type="string" value="80-100%"></choice></chooser>
+    <chooser x="322" y="466" height="55" variable="blue-group-3" current="1" width="108" display="blue-group-3"><choice type="string" value="0-20%"></choice><choice type="string" value="20-40%"></choice><choice type="string" value="40-60%"></choice><choice type="string" value="60-80%"></choice><choice type="string" value="80-100%"></choice></chooser>
+    <chooser x="210" y="524" height="55" variable="red-group-4" current="2" width="108" display="red-group-4"><choice type="string" value="0-20%"></choice><choice type="string" value="20-40%"></choice><choice type="string" value="40-60%"></choice><choice type="string" value="60-80%"></choice><choice type="string" value="80-100%"></choice></chooser>
+    <chooser x="322" y="524" height="55" variable="blue-group-4" current="2" width="108" display="blue-group-4"><choice type="string" value="0-20%"></choice><choice type="string" value="20-40%"></choice><choice type="string" value="40-60%"></choice><choice type="string" value="60-80%"></choice><choice type="string" value="80-100%"></choice></chooser>
+    <chooser x="210" y="582" height="55" variable="red-group-5" current="4" width="108" display="red-group-5"><choice type="string" value="0-20%"></choice><choice type="string" value="20-40%"></choice><choice type="string" value="40-60%"></choice><choice type="string" value="60-80%"></choice><choice type="string" value="80-100%"></choice></chooser>
+    <chooser x="322" y="582" height="55" variable="blue-group-5" current="4" width="108" display="blue-group-5"><choice type="string" value="0-20%"></choice><choice type="string" value="20-40%"></choice><choice type="string" value="40-60%"></choice><choice type="string" value="60-80%"></choice><choice type="string" value="80-100%"></choice></chooser>
+    <monitor x="210" precision="17" y="645" height="55" fontSize="11" width="108" display="last winner">winner</monitor>
+    <monitor x="322" precision="3" y="645" height="55" fontSize="11" width="108" display="success rate">compromise-success-rate</monitor>
+    <monitor x="210" precision="0" y="705" height="55" fontSize="11" width="108" display="purple wins">purple-wins</monitor>
+    <monitor x="322" precision="3" y="705" height="55" fontSize="11" width="108" display="purple vote share">purple-vote-share</monitor>
+    <monitor x="210" precision="3" y="765" height="55" fontSize="11" width="108" display="mean P red">mean-p-red</monitor>
+    <monitor x="322" precision="3" y="765" height="55" fontSize="11" width="108" display="mean P blue">mean-p-blue</monitor>
+    <plot x="880" autoPlotX="true" yMax="6.0" autoPlotY="true" yAxis="votes" y="10" xMin="0.0" height="220" legend="true" xMax="3.0" yMin="0.0" width="320" xAxis="red / purple / blue" display="Votes This Trial"><setup></setup><update></update><pen interval="1.0" mode="1" display="red" color="-2674135" legend="true"><setup></setup><update></update></pen><pen interval="1.0" mode="1" display="purple" color="-8630108" legend="true"><setup></setup><update></update></pen><pen interval="1.0" mode="1" display="blue" color="-13345367" legend="true"><setup></setup><update></update></pen></plot>
+    <plot x="880" autoPlotX="true" yMax="100.0" autoPlotY="true" yAxis="% voting purple" y="235" xMin="0.0" height="215" legend="false" xMax="10.0" yMin="0.0" width="320" xAxis="trial" display="Purple Vote % per Trial"><setup></setup><update></update><pen interval="1.0" mode="0" display="purple %" color="-8630108" legend="true"><setup></setup><update></update></pen></plot>
+    <plot x="440" autoPlotX="true" yMax="1.0" autoPlotY="true" yAxis="mean P(compromise)" y="455" xMin="0.0" height="210" legend="true" xMax="10.0" yMin="0.0" width="430" xAxis="trial" display="Willingness to Compromise"><setup></setup><update></update><pen interval="1.0" mode="0" display="red party" color="-2674135" legend="true"><setup></setup><update></update></pen><pen interval="1.0" mode="0" display="blue party" color="-13345367" legend="true"><setup></setup><update></update></pen><pen interval="1.0" mode="0" display="all agents" color="-7500403" legend="true"><setup></setup><update></update></pen></plot>
+    <plot x="880" autoPlotX="true" yMax="1.0" autoPlotY="true" yAxis="purple wins / trials" y="455" xMin="0.0" height="210" legend="false" xMax="10.0" yMin="0.0" width="320" xAxis="trial" display="Compromise Success Rate"><setup></setup><update></update><pen interval="1.0" mode="0" display="success rate" color="-8630108" legend="true"><setup></setup><update></update></pen></plot>
+  </widgets>
+  <info><![CDATA[## WHAT IS IT?
+
+This model predicts how often a small legislature reaches political compromise over a series of votes. Legislators come from a **red** party and a **blue** party. On each trial (one bill) every legislator votes for either their own party's bill or the **purple** compromise bill. The vote outcome and the legislator's own choice determine a reward, and that reward changes the legislator's willingness to compromise on the next bill.
+
+## HOW IT WORKS
+
+**Initial state.** Each agent's constituency extremism *e* is set by the sliders. Its starting probability of compromising is `1 - e`. For example, a 70% extreme district gives a 30% chance of voting purple.
+
+**Limits on P(compromise).** After every update, an agent's P(compromise) is kept between **1% and 99%**, and starting values are limited the same way. Every legislator always keeps some chance of breaking from their usual vote. Without this limit, learning pushes agents to almost exactly 0% or 100%, and they never change again.
+
+* With **6 agents** the `red-agent-1..3` and `blue-agent-1..3` sliders are used.
+* With **30 agents** (Levels 0.5 and 1), each party has 5 groups of 3. For each group the user picks an extremism bucket (0-20%, 20-40%, 40-60%, 60-80%, 80-100%). Each agent in the group gets an extremism value drawn at random from within that bucket.
+
+**Each trial:**
+
+1. **Vote.** Each agent votes purple with probability `P(compromise)` and otherwise votes for its own party's bill.
+2. **Tally.** The bill with the most votes wins (plurality rule). A tie for first place counts as a **tie**.
+3. **Payoff.**
+
+| | Own bill wins | Purple wins | Own bill loses | Tie |
+|---|---|---|---|---|
+| Compromise | 3 | 4 | 0 | 0 |
+| Don't compromise | 5 | 2 | 1 | 0 |
+
+4. **Learn.** Each agent updates `P(compromise)` with one of the rules below.
+
+**Imitation dynamics (Level 0-1).** `u_a` is the average payoff that all agents choosing action *a* received this trial. The logit rule is `P(a) = e^(λ·u_a) / Σ_q e^(λ·u_q)`.
+By default (**keep-own-tendency? OFF**) this equation is used as written, so every agent ends up with the same probability after the first trial and extremism only shapes the first vote. With the switch **ON**, each term is weighted by the agent's current probability: `P'(a) ∝ P(a)·e^(λ·u_a)`. Then λ sets how strongly agents move toward the better-paying action (λ = 0 means no change), and agents keep their constituency-driven differences. If every agent took the same action this trial, or the vote tied (everyone gets 0), there is nothing to compare and probabilities stay the same.
+
+**Reinforcement learning (Level 0-2).** This is Roth-Erev learning. Each agent keeps propensities `q_compromise` and `q_hold`, which start at `initial-propensity × (1-e)` and `initial-propensity × e`. After each trial, both propensities are multiplied by `(1 - forgetting)`, and then the chosen action's propensity increases by the payoff. Then `p_k = q_k / Σ_j q_j`. A larger `initial-propensity` means slower learning. Forgetting is fixed at 0.1 per trial, so a payoff from 10 votes ago counts about a third as much as today's. Recent outcomes therefore count more than old ones.
+
+**Combined (Level 1).** On each trial an agent uses imitation with probability `1 - e` and reinforcement otherwise. Agents from more extreme constituencies therefore rely more on reinforcement, which is more prone to feedback loops. Propensities are updated on every trial, whichever rule the agent uses.
+
+## HOW TO USE IT
+
+* Level 0-1: `learning-mode` = Imitation, `num-agents` = 6
+* Level 0-2: `learning-mode` = Reinforcement, `num-agents` = 6
+* Level 0.5: either of those modes, `num-agents` = 30
+* Level 1: `learning-mode` = Combined, `num-agents` = 30
+
+Set the parameters, press **setup**, then press **run all trials** (stops after `num-trials`) or **one trial**. Parameters are locked in when you press **setup**. Changes you make mid-run take effect only after the next **setup**.
+
+**View:** Each agent is a circle (red party on the left, blue on the right) and turns the color of the bill it just voted for: red, blue, or purple. The purple bill is a single bill that already contains concessions from both sides, so it passes simply by getting the most votes. It does not depend on any particular pair of legislators. Each agent's label is its `P(compromise)` for the next trial.
+
+## THINGS TO NOTICE
+
+* **Compromise success rate** = purple bills passed / trials.
+* **Purple vote share** = purple votes / all votes cast.
+* Compare the two parties' willingness curves when their extremism is unequal.
+
+## THINGS TO TRY
+
+* Sweep extremism from low to high. Is there a tipping point where compromise collapses?
+* Compare imitation and reinforcement with the same extremism. Which one locks in faster?
+* Raise λ. Does imitation produce cascades toward always or never compromising?
+* Use BehaviorSpace (Tools menu) to run the included experiment, which compares learning modes and λ values.
+
+## CREDITS
+
+DC Seminar agent-based model of political compromise.
+]]></info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point><point x="40" y="250"></point><point x="150" y="205"></point><point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false"><dash value="0.0"></dash><dash value="1.0"></dash></line>
+        <line x="0.0" visible="true"><dash value="1.0"></dash><dash value="0.0"></dash></line>
+        <line x="0.2" visible="false"><dash value="0.0"></dash><dash value="1.0"></dash></line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="mode-by-lambda" repetitions="20" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="100"><setup>setup</setup><go>go</go><metrics><metric>compromise-success-rate</metric><metric>purple-vote-share</metric><metric>mean-p-red</metric><metric>mean-p-blue</metric></metrics><constants><enumeratedValueSet variable="learning-mode"><value value='"Imitation"'></value><value value='"Reinforcement"'></value><value value='"Combined"'></value></enumeratedValueSet><enumeratedValueSet variable="num-agents"><value value="30"></value></enumeratedValueSet><enumeratedValueSet variable="num-trials"><value value="100"></value></enumeratedValueSet><enumeratedValueSet variable="lambda"><value value="0.5"></value><value value="1"></value><value value="2"></value></enumeratedValueSet></constants></experiment>
+  </experiments>
+</model>
