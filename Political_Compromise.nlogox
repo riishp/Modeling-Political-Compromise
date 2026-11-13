@@ -119,6 +119,7 @@ globals [
 ;; There is one agent type: a legislator. The outline also had no other
 ;; objects in the model (no institutions or bills as agents).
 ;; ---------------------------------------------------------------------
+;; Rishika - sets up the properties of each turtle/agent (each circle in our simulation)
 turtles-own [
   party          ; "red" or "blue": fixed for the whole run
   group-id       ; constituency group: 1-3 with 6 agents (one agent each), 1-5 with 30 (3 agents each)
@@ -172,6 +173,7 @@ to make-agents [ pty ]
     create-turtles 1 [
       set party pty
 
+    ;; Rishika - sets up extremism values from sliders for both 6 agents and 30 agent mode (separately)
       ;; ---- constituency extremism (decision 11) ----
       ifelse num-agents = 6 [
         ;; Level 0: each of the 3 per-party sliders sets one agent exactly.
@@ -184,11 +186,12 @@ to make-agents [ pty ]
         set group-id floor (i / 3) + 1
         set extremism bucket-extremism pty group-id
       ]
-
+      ;; Rishika - likelihood to compromise is inverse of extremism value intialized
       ;; ---- starting willingness to compromise ----
       ;; From the outline: willingness = the inverse of extremism. A 70%
       ;; extreme district gives a 30% chance of voting purple. Fix C keeps
       ;; it within 1%-99%.
+      ;; Rishika - decided 1 - 99% to prevent going fully to an extreme
       set p-compromise bound-p (1 - extremism)
 
       ;; ---- reinforcement starting propensities (Level 0-2 / Combined) ----
@@ -198,6 +201,11 @@ to make-agents [ pty ]
       ;; new payoff moves the agent less (slower learning).
       set q-compromise initial-propensity * p-compromise
       set q-hold initial-propensity * (1 - p-compromise)
+
+      ;; Rishika - in the combined model, the probability of using imitation dynamics vs reinforcement 
+      ;;learning is decided every round; inverse of extremism is the threshold; random probability is 
+      ;; "draw" and if its below that threshold, decision is made on imitation dynamics, otherwise
+      ;; reinforcement learning - actually happens in later section
 
       ;; ---- Combined mode (Level 1, decision 7) ----
       ;; More extreme districts -> more reliance on reinforcement learning,
@@ -245,6 +253,8 @@ to-report bucket-names
   report [ "0-20%" "20-40%" "40-60%" "60-80%" "80-100%" ]
 end
 
+;; Rishika - randomly sets the probability for each agent within a bucket (ex. 0-20, etc)
+
 ;; 30-agent mode: random extremism inside group g's chosen bucket,
 ;; e.g. "60-80%" gives a uniform random value from 0.60 up to (not including) 0.80.
 to-report bucket-extremism [ pty g ]
@@ -273,7 +283,7 @@ end
 ;; Order each trial: vote -> count -> pay -> learn -> redraw -> plot.
 ;; Agents act synchronously: everyone votes before anyone learns.
 ;; =====================================================================
-
+;; Rishika - loops and updates/calculates the variables until max number of trials is hit (set by user)
 to go
   if ticks >= run-trials [ stop ]   ; stop after the user-chosen number of trials
   vote
@@ -290,6 +300,7 @@ end
 ;; otherwise votes for its own party's bill. On trial 1, p-compromise comes
 ;; straight from extremism. Later it is whatever learning produced.
 ;; ---------------------------------------------------------------------
+;; Rishika - calculations to vote purple based on initial settings
 to vote
   ask turtles [
     set choice ifelse-value (random-float 1 < p-compromise) [ "purple" ] [ party ]
@@ -299,21 +310,27 @@ end
 ;; ---------------------------------------------------------------------
 ;; TALLY: count votes and pick the winner (decision 2: plurality rule).
 ;; ---------------------------------------------------------------------
+;; Rishika - counts and updates bar chart with vote tallies
 to tally
   set red-votes    count turtles with [ choice = "red" ]
   set blue-votes   count turtles with [ choice = "blue" ]
-  set purple-votes count turtles with [ choice = "purple" ]
+  set purple-votes count turtles with [ choice = "purple" ] 
   set total-red    total-red + red-votes
   set total-blue   total-blue + blue-votes
   set total-purple total-purple + purple-votes
 
   ;; Most votes wins. If two or more bills share the top count, the trial
   ;; is a "tie". With 6 agents this is common, e.g. 2-2-2 or 3-3-0.
+
+  ;; Rishika - plurality (bill with the most votes wins, not based on majority)
   let counts (list red-votes blue-votes purple-votes)
   let top max counts
+  ;; Rishika - accounts fo ties
   ifelse length filter [ c -> c = top ] counts > 1 [
     set winner "tie"
     set ties ties + 1
+
+    ;; Rishika - win count increases based on which bill
   ] [
     set winner item (position top counts) [ "red" "blue" "purple" ]
     if winner = "red"    [ set red-wins red-wins + 1 ]
@@ -326,6 +343,7 @@ end
 ;; PAY: every agent gets a reward from the outline's payoff table, based
 ;; on its own vote and on which bill won.
 ;; ---------------------------------------------------------------------
+;; Rishika -  based on the payoff matrix we made, updates/returns what values each turtle should get
 to pay
   ask turtles [ set payoff payoff-for choice party winner ]
 end
@@ -360,7 +378,9 @@ to learn
   ;; pooled. Every agent sees the same two numbers.
   let comps turtles with [ choice = "purple" ]
   let holds turtles with [ choice != "purple" ]
-
+;;Rishika - payoff is for everyone, not only from own party so if other party 
+;;is succeeding my compromising, it will also look more appealing to other party
+;;Rishika - ties don't do anything - no change/comparison
   ;; Decision 5 and fix B: there is no signal if nobody (or everybody)
   ;; compromised, or if the vote tied. A tie pays everyone 0, which would
   ;; otherwise reset everyone to 50/50.
@@ -374,6 +394,8 @@ to learn
     ;; Propensities are updated EVERY trial in every mode, so reinforcement
     ;; memory stays current even for agents that used imitation this trial.
     reinforce-accumulate
+
+;; Rishika - can see the mechanism for picking imitation vs reinforcement on combined mode
 
     ;; Pick this trial's learning rule
     if run-mode = "Imitation"     [ set method "imitation" ]       ; Level 0-1
@@ -404,6 +426,9 @@ end
 ;;   lambda = 0 then means "no change", and agents keep their
 ;;   constituency-driven differences.
 ;; ---------------------------------------------------------------------
+
+;; Rishika - imitation dynamic function - claude's comment above based 
+;;on the equations/reasoning we inputted from our outline
 to imitate
   if imitation-info? [
     let wc exp (run-lambda * u-compromise)   ; weight on compromising
@@ -426,6 +451,8 @@ end
 ;;     q_k <- (1 - forgetting) * q_k + payoff   if k was chosen
 ;;     q_k <- (1 - forgetting) * q_k            otherwise
 ;; ---------------------------------------------------------------------
+;; Rishika - reinforcement leanring function as in our outline (claude comment above again)
+;; Rishika - addeed a forgetting percentage fixed at 0.1 (user can't change) to mimic recency bias
 
 ;; Decision 8: fixed recency rate. With 0.1, a payoff from 10 trials ago
 ;; counts about 35% as much as the latest one (0.9^10 ≈ 0.35). It is a
@@ -459,7 +486,7 @@ end
 ;; =====================================================================
 ;; VISUALS AND OUTPUTS
 ;; =====================================================================
-
+;; Rishika - visuals
 ;; Decision 12: each circle takes the color of the bill it just voted for
 ;; (red, blue or purple). No links are drawn, because purple is a single
 ;; compromise bill, not an agreement between specific agents.
@@ -477,6 +504,7 @@ to update-label
 end
 
 ;; ---- outputs listed in the outline ----
+;; Rishika - we wanted purple bills passed over trials run to see how that percentage is changing over time
 
 ;; Decision 6: compromise success rate = purple bills passed / trials run.
 ;; For example, 0.8 means purple won 80% of the votes so far.
@@ -498,7 +526,8 @@ end
 to-report mean-p [ pty ]
   report mean [ p-compromise ] of turtles with [ party = pty ]
 end
-
+;; Rishika - the gray boxes on our model that show the different values changing
+;; Rishika - user can't change, just purely output
 ;; Monitors use these argument-free versions.
 to-report mean-p-red
   report mean-p "red"
