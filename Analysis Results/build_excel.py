@@ -75,7 +75,7 @@ def header(ws, row, cols, widths=None):
     if widths:
         for j, w in enumerate(widths, 1):
             ws.column_dimensions[get_column_letter(j)].width = w
-    ws.freeze_panes = ws.cell(row=row + 1, column=1)
+    ws.freeze_panes = f"A{row + 1}"   # string, so no empty cell/row is created
 
 
 def run_records(runs, setting_col, setting_fmt=lambda v: v):
